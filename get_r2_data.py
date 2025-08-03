@@ -2,14 +2,19 @@
 Download and process data from R2 storage.
 
 Usage:
-  python get_r2data.py              # Download and normalize data
-  python get_r2data.py --filter     # Download, normalize, and filter data (score==1)
-  python get_r2data.py --filter     # If normalized data exists, only filter it
+  python get_r2data.py                          # Download and normalize data
+  python get_r2data.py --filter                 # Download, normalize, and filter data (score==1 by default)
+  python get_r2data.py --filter                 # If normalized data exists, only filter it
+  python get_r2data.py --filter --score 0       # Filter for score==0
+  python get_r2data.py --filter --score both    # Include all scores (no score filtering)
+  python get_r2data.py --filter --uid 123      # Filter for specific UID
+  python get_r2data.py --filter --model "gpt4" # Filter for specific model
+  python get_r2data.py --filter --uid 123 --model "gpt4" --score 0 # Combine multiple filters
 
 The script:
 1. Downloads JSON files from R2 storage
 2. Normalizes nested fields to JSON strings for consistent schema
-3. Optionally filters data to include only rows with score==1
+3. Optionally filters data by score (0, 1, or both), UID, and/or model name
 """
 
 import affine as af
@@ -48,9 +53,13 @@ def normalize_result(item):
         normalized['challenge']['extra_json'] = json.dumps(normalized['challenge']['extra'])
         del normalized['challenge']['extra']
     
-    # Convert evaluation.extra to JSON string if it exists
-    if 'evaluation' in normalized and 'extra' in normalized['evaluation']:
+    # Convert evaluation.extra to JSON string if it exists and is not empty
+    if ('evaluation' in normalized and 'extra' in normalized['evaluation'] and 
+        normalized['evaluation']['extra'] and normalized['evaluation']['extra'] != {}):
         normalized['evaluation']['extra_json'] = json.dumps(normalized['evaluation']['extra'])
+        del normalized['evaluation']['extra']
+    elif 'evaluation' in normalized and 'extra' in normalized['evaluation']:
+        # Remove empty extra field without creating extra_json
         del normalized['evaluation']['extra']
     
     # Convert miner.chute to JSON string if it exists
@@ -99,9 +108,25 @@ async def process_file(client, key, semaphore):
                 if isinstance(json_data, list):
                     for item in json_data:
                         if isinstance(item, dict) and all(key in item for key in REQUIRED_KEYS):
+                            # Validate score - must be exactly 0 or 1
+                            score = item.get('evaluation', {}).get('score')
+                            # Convert score to int if it's a valid numeric value
+                            if isinstance(score, (int, float)) and score in [0, 1]:
+                                score = int(score)
+                                item['evaluation']['score'] = score
+                            else:
+                                continue  # Skip items with invalid score values
                             normalized_items.append(normalize_result(item))
                 else:
                     # If it's a single object
+                    # Validate score - must be exactly 0 or 1
+                    score = json_data.get('evaluation', {}).get('score')
+                    # Convert score to int if it's a valid numeric value
+                    if isinstance(score, (int, float)) and score in [0, 1]:
+                        score = int(score)
+                        json_data['evaluation']['score'] = score
+                    else:
+                        return None, f"Invalid score value ({score}) in {key}"
                     normalized_items.append(normalize_result(json_data))
                 
                 return normalized_items, None
@@ -123,11 +148,17 @@ async def main():
     start_time = time.time()
     
     # Create output JSONL file
-    output_file = Path("combined_data_normalized.jsonl")
+    output_file = Path("combined_data.jsonl")
     
-    # Clear the file if it exists
+    # Check if file exists and prompt user
     if output_file.exists():
-        output_file.unlink()
+        response = input(f"\n{output_file} already exists. Do you want to overwrite it? (y/N): ")
+        if response.lower() != 'y':
+            print("Aborting download. Use --filter to filter existing data.")
+            return
+        else:
+            output_file.unlink()
+            print(f"Overwriting {output_file}...")
     
     get_client_ctx = lambda: get_session().create_client(
         "s3",
@@ -215,11 +246,25 @@ async def main():
         print("  - evaluation.extra → evaluation.extra_json")
         print("  - miner.chute → miner.chute_json")
 
-def filter_data(input_file, output_file):
+def filter_data(input_file, output_file, filter_uid=None, filter_model=None, filter_score='1'):
     """
-    Filter the normalized data to only include rows with score == 1 
-    and extract specific fields
+    Filter the normalized data and extract specific fields. 
+    Optionally filter by specific UID, model name, or score.
     """
+    # Print filter criteria
+    filters = []
+    if filter_score != 'both':
+        filters.append(f"score == {filter_score}")
+    if filter_uid is not None:
+        filters.append(f"uid == {filter_uid}")
+    if filter_model is not None:
+        filters.append(f"model == '{filter_model}'")
+    
+    if filters:
+        print(f"Filtering with criteria: {' AND '.join(filters)}")
+    else:
+        print("Extracting all data (no score filtering)")
+    
     # First, count the number of lines for progress bar
     with open(input_file, "r", encoding="utf-8") as fin:
         total_lines = sum(1 for _ in fin)
@@ -244,13 +289,27 @@ def filter_data(input_file, output_file):
                 score = evaluation.get("score")
                 evaluation_extra_json = evaluation.get("extra_json")
                 
-                # Filter for required fields and score == 1
+                # Validate score - must be exactly 0 or 1
+                # Convert score to int if it's a valid numeric value
+                if isinstance(score, (int, float)) and score in [0, 1]:
+                    score = int(score)
+                else:
+                    continue  # Skip records with invalid score values
+                
+                # Apply filters
+                score_match = (filter_score == 'both' or 
+                             (filter_score == '0' and score == 0) or 
+                             (filter_score == '1' and score == 1))
+                
+                # Filter for required fields and matching criteria
                 if (
                     env is not None and
                     prompt is not None and
                     resp is not None and
                     model is not None and
-                    score == 1
+                    score_match and
+                    (filter_uid is None or uid == filter_uid) and
+                    (filter_model is None or model == filter_model)
                 ):
                     filtered = {
                         "uid": uid,
@@ -272,16 +331,21 @@ def filter_data(input_file, output_file):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download and process R2 data")
-    parser.add_argument("--filter", action="store_true", help="Filter data with score == 1 and save to filtered_data.jsonl")
+    parser.add_argument("--filter", action="store_true", help="Filter data and save to filtered_data.jsonl")
+    parser.add_argument("--uid", type=int, help="Filter by specific UID number")
+    parser.add_argument("--model", type=str, help="Filter by specific model name")
+    parser.add_argument("--score", type=str, choices=['0', '1', 'both'], default='1', 
+                        help="Filter by score: 0, 1, or both (default: 1)")
     args = parser.parse_args()
     
-    output_file = Path("combined_data_normalized.jsonl")
+    output_file = Path("combined_data.jsonl")
     
     # If filter flag is set and normalized data already exists, skip download
     if args.filter and output_file.exists():
         print(f"Found existing {output_file}, skipping download...")
         print("Running filtering only...")
-        filter_data(str(output_file), "filtered_data.jsonl")
+        filter_data(str(output_file), "filtered_data.jsonl", 
+                   filter_uid=args.uid, filter_model=args.model, filter_score=args.score)
     else:
         # Run main download/processing
         asyncio.run(main())
@@ -289,4 +353,5 @@ if __name__ == "__main__":
         # If filter flag is set, run the filtering after download
         if args.filter:
             print("\nRunning filtering...")
-            filter_data(str(output_file), "filtered_data.jsonl")
+            filter_data(str(output_file), "filtered_data.jsonl", 
+                       filter_uid=args.uid, filter_model=args.model, filter_score=args.score)
