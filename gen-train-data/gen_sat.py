@@ -7,7 +7,7 @@ from affine.envs.sat import SAT
 
 async def generate_sat_problems(num_problems=10000):
     """Generate SAT problems and save to JSONL file."""
-    sat_env = SAT(n=10, k=3, m=42)  # 3-SAT with 10 variables, ~42 clauses
+    sat_env = SAT(n=10, k=3)  # 3-SAT with 10 variables, m defaults to int(4.26 * n)
     
     problems = []
     
@@ -23,7 +23,8 @@ async def generate_sat_problems(num_problems=10000):
             "clauses": challenge.extra["cls"],
             "n_variables": sat_env.n,
             "k_sat": sat_env.k,
-            "n_clauses": sat_env.m
+            "n_clauses": sat_env.m,
+            "formula": challenge.prompt.split('\n')[1]  # Extract the formula from the prompt
         }
         
         problems.append(problem_data)
